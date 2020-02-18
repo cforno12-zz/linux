@@ -1670,10 +1670,12 @@ static void ibmveth_set_multicast_list(struct net_device *netdev)
 static int ibmveth_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct ibmveth_adapter *adapter = netdev_priv(dev);
-	struct vio_dev *viodev = adapter->vdev;
+	int old_active_pools[IBMVETH_NUM_BUFF_POOLS];
 	int new_mtu_oh = new_mtu + IBMVETH_BUFF_OH;
-	int i, rc;
+	struct vio_dev *viodev = adapter->vdev;
+	int old_mtu = dev->mtu;
 	int need_restart = 0;
+	int i, rc;
 
 	for (i = 0; i < IBMVETH_NUM_BUFF_POOLS; i++)
 		if (new_mtu_oh <= adapter->rx_buff_pool[i].buff_size)
@@ -1684,33 +1686,43 @@ static int ibmveth_change_mtu(struct net_device *dev, int new_mtu)
 
 	/* Deactivate all the buffer pools so that the next loop can activate
 	   only the buffer pools necessary to hold the new MTU */
-	if (netif_running(adapter->netdev)) {
+	if (netif_running(dev)) {
+		for (i = 0; i < IBMVETH_NUM_BUFF_POOLS; i++)
+			old_active_pools[i] = adapter->rx_buff_pool[i].active;
 		need_restart = 1;
-		adapter->pool_config = 1;
-		ibmveth_close(adapter->netdev);
-		adapter->pool_config = 0;
+		rc = ibmveth_restart_close(dev);
+		if (rc) {
+			netif_wake_queue(dev);
+			return rc;
+		}
 	}
 
 	/* Look for an active buffer pool that can hold the new MTU */
 	for (i = 0; i < IBMVETH_NUM_BUFF_POOLS; i++) {
 		adapter->rx_buff_pool[i].active = 1;
-
-		if (new_mtu_oh <= adapter->rx_buff_pool[i].buff_size) {
-			dev->mtu = new_mtu;
-			vio_cmo_set_dev_desired(viodev,
-						ibmveth_get_desired_dma
-						(viodev));
-			if (need_restart) {
-				return ibmveth_open(adapter->netdev);
-			}
-			return 0;
-		}
+		if (new_mtu_oh <= adapter->rx_buff_pool[i].buff_size)
+			break;
 	}
 
-	if (need_restart && (rc = ibmveth_open(adapter->netdev)))
-		return rc;
+	dev->mtu = new_mtu;
+	vio_cmo_set_dev_desired(viodev, ibmveth_get_desired_dma(viodev));
 
-	return -EINVAL;
+	if (need_restart) {
+		rc = ibmveth_restart_open(dev);
+		if (rc)
+			goto revert_mtu;
+	}
+
+	return 0;
+
+ revert_mtu:
+	/* revert active buffers, mtu, and desired resources */
+	for (i = 0; i < IBMVETH_NUM_BUFF_POOLS; i++)
+		adapter->rx_buff_pool[i].active = old_active_pools[i];
+	dev->mtu = old_mtu;
+	vio_cmo_set_dev_desired(viodev, ibmveth_get_desired_dma(viodev));
+	rc = ibmveth_restart_open(dev);
+	return rc ? rc : -EINVAL;
 }
 
 #ifdef CONFIG_NET_POLL_CONTROLLER
