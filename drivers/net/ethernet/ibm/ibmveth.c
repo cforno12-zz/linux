@@ -714,6 +714,182 @@ static int ibmveth_close(struct net_device *netdev)
 	return 0;
 }
 
+static int ibmveth_reset_buffer_pool(struct ibmveth_adapter *adapter,
+				     struct ibmveth_buff_pool *pool)
+{
+	int i;
+
+	/* free any existing socket buffers in the pool */
+	if (pool->skbuff && pool->dma_addr) {
+		for (i = 0; i < pool->size; ++i) {
+			struct sk_buff *skb = pool->skbuff[i];
+
+			if (skb) {
+				dma_unmap_single(&adapter->vdev->dev,
+						 pool->dma_addr[i],
+						 pool->buff_size,
+						 DMA_FROM_DEVICE);
+				dev_kfree_skb_any(skb);
+			}
+		}
+	}
+	/* sanitize dma_addr and skbuff arrays */
+	if (pool->dma_addr)
+		memset(pool->dma_addr, 0, pool->size * sizeof(dma_addr_t));
+	if (pool->skbuff)
+		memset(pool->skbuff, 0, pool->size * sizeof(void *));
+	/* restore initial pool settings */
+	for (i = 0; i < pool->size; ++i)
+		pool->free_map[i] = i;
+	atomic_set(&pool->available, 0);
+	pool->producer_index = 0;
+	pool->consumer_index = 0;
+	return 0;
+}
+
+static int ibmveth_restart_close(struct net_device *netdev)
+{
+	struct ibmveth_adapter *adapter = netdev_priv(netdev);
+	long lpar_rc;
+	int i;
+
+	netdev_dbg(netdev, "close to restart starting\n");
+
+	napi_disable(&adapter->napi);
+
+	netdev_dbg(netdev, "Disabled napi\n");
+
+	netif_stop_queue(netdev);
+
+	lpar_rc = h_vio_signal(adapter->vdev->unit_address, VIO_IRQ_DISABLE);
+	if (lpar_rc != H_SUCCESS) {
+		netdev_err(netdev, "error sending interrupt to hypervisor with %lx",
+			   lpar_rc);
+		napi_enable(&adapter->napi);
+		netdev_err(netdev, "enabled napi\n");
+		return -ENONET;
+	}
+
+	netdev_dbg(netdev, "Signaled to VIOS.\n");
+
+	do {
+		lpar_rc = h_free_logical_lan(adapter->vdev->unit_address);
+	} while (H_IS_LONG_BUSY(lpar_rc) || (lpar_rc == H_BUSY));
+
+	if (lpar_rc != H_SUCCESS) {
+		netdev_err(netdev, "h_free_logical_lan failed with %lx, continuing with restart to close\n",
+			   lpar_rc);
+		napi_enable(&adapter->napi);
+		return -EPERM;
+	}
+
+	ibmveth_update_rx_no_buffer(adapter);
+
+	for (i = 0; i < IBMVETH_NUM_BUFF_POOLS; i++) {
+		if (adapter->rx_buff_pool[i].active) {
+			ibmveth_reset_buffer_pool(adapter,
+						  &adapter->rx_buff_pool[i]);
+		}
+	}
+
+	netdev_dbg(netdev, "close to restart complete\n");
+
+	return 0;
+}
+
+static int ibmveth_restart_open(struct net_device *netdev)
+{
+	struct ibmveth_adapter *adapter = netdev_priv(netdev);
+	union ibmveth_buf_desc rxq_desc;
+	dma_addr_t new_bounce_dma;
+	void *new_bounce_buffer;
+	unsigned long lpar_rc;
+	int rxq_entries = 1;
+	u64 mac_address;
+	int pool;
+
+	netdev_dbg(netdev, "open to restart starting\n");
+
+	napi_enable(&adapter->napi);
+
+	for (pool = 0; pool < IBMVETH_NUM_BUFF_POOLS; pool++)
+		rxq_entries += adapter->rx_buff_pool[pool].size;
+
+	adapter->rx_queue.queue_len = sizeof(struct ibmveth_rx_q_entry) *
+						rxq_entries;
+	adapter->rx_queue.index = 0;
+	adapter->rx_queue.num_slots = rxq_entries;
+	adapter->rx_queue.toggle = 1;
+
+	mac_address = ibmveth_encode_mac_addr(netdev->dev_addr);
+
+	rxq_desc.fields.flags_len = IBMVETH_BUF_VALID |
+					adapter->rx_queue.queue_len;
+	rxq_desc.fields.address = adapter->rx_queue.queue_dma;
+
+	netdev_dbg(netdev, "buffer list @ 0x%p\n",
+		   adapter->buffer_list_addr);
+	netdev_dbg(netdev, "filter list @ 0x%p\n",
+		   adapter->filter_list_addr);
+	netdev_dbg(netdev, "receive q   @ 0x%p\n",
+		   adapter->rx_queue.queue_addr);
+
+	memset(adapter->buffer_list_addr, 0,
+	       sizeof(*adapter->buffer_list_addr));
+	memset(adapter->filter_list_addr, 0,
+	       sizeof(*adapter->filter_list_addr));
+
+	netdev_dbg(netdev, "Registering adapter w PHYP.\n");
+	lpar_rc = ibmveth_register_logical_lan(adapter, rxq_desc, mac_address);
+
+	if (lpar_rc != H_SUCCESS) {
+		netdev_err(netdev, "h_register_logical_lan failed with %ld\n",
+			   lpar_rc);
+		netdev_err(netdev, "buffer TCE:0x%llx filter TCE:0x%llx rxq_desc:0x%llx MAC:0x%llx\n",
+			   adapter->buffer_list_dma,
+			   adapter->filter_list_dma,
+			   rxq_desc.desc,
+			   mac_address);
+		return -ENONET;
+	}
+
+	/* Altering bounce buffer to hold new MTU */
+	new_bounce_buffer = kmalloc(netdev->mtu + IBMVETH_BUFF_OH, GFP_KERNEL);
+	if (!new_bounce_buffer)
+		return -ENOMEM;
+	new_bounce_dma = dma_map_single(&adapter->vdev->dev, new_bounce_buffer,
+					netdev->mtu + IBMVETH_BUFF_OH,
+					DMA_BIDIRECTIONAL);
+	if (dma_mapping_error(&adapter->vdev->dev, new_bounce_dma)) {
+		netdev_err(netdev, "unable to map bounce buffer\n");
+		kfree(new_bounce_buffer);
+		return -ENOMEM;
+	}
+
+	kfree(adapter->bounce_buffer);
+	adapter->bounce_buffer = new_bounce_buffer;
+	adapter->bounce_buffer_dma = new_bounce_dma;
+
+	for (pool = 0; pool < IBMVETH_NUM_BUFF_POOLS; pool++) {
+		if (adapter->rx_buff_pool[pool].allocated)
+			continue;
+
+		if (ibmveth_alloc_buffer_pool(&adapter->rx_buff_pool[pool])) {
+			netdev_err(netdev, "unable to alloc pool\n");
+			return -ENOMEM;
+		}
+	}
+
+	netdev_dbg(netdev, "initial replenish cycle\n");
+	ibmveth_interrupt(netdev->irq, netdev);
+
+	netif_start_queue(netdev);
+
+	netdev_dbg(netdev, "open to restart complete\n");
+
+	return 0;
+}
+
 static int netdev_get_link_ksettings(struct net_device *dev,
 				     struct ethtool_link_ksettings *cmd)
 {
