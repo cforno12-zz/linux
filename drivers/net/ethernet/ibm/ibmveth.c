@@ -187,6 +187,7 @@ static int ibmveth_alloc_buffer_pool(struct ibmveth_buff_pool *pool)
 	atomic_set(&pool->available, 0);
 	pool->producer_index = 0;
 	pool->consumer_index = 0;
+	pool->allocated = 0;
 
 	return 0;
 }
@@ -354,6 +355,7 @@ static void ibmveth_free_buffer_pool(struct ibmveth_adapter *adapter,
 		kfree(pool->skbuff);
 		pool->skbuff = NULL;
 	}
+	pool->allocated = -1;
 }
 
 /* remove a buffer from a pool */

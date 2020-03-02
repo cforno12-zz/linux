@@ -119,6 +119,7 @@ struct ibmveth_buff_pool {
     struct sk_buff **skbuff;
     int active;
     struct kobject kobj;
+	int allocated;
 };
 
 struct ibmveth_rx_q {
