@@ -2334,6 +2334,12 @@ static void ibmvnic_tx_timeout(struct net_device *dev, unsigned int txqueue)
 {
 	struct ibmvnic_adapter *adapter = netdev_priv(dev);
 
+	netdev_err(adapter->netdev, "lijun %s: hit tx_timeout in %d sec\n", __func__, dev->watchdog_timeo/HZ);
+	if (test_bit(0, &adapter->resetting)) {
+		netdev_err(adapter->netdev, "lijun %s: adapter is under resetting, skip timeout reset\n", __func__);
+		return;
+   }
+
 	ibmvnic_reset(adapter, VNIC_RESET_TIMEOUT);
 }
 
